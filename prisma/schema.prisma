@@ -1,0 +1,242 @@
+// SynaptAgent schema. Relations corrected vs the original handoff so it passes
+// `prisma validate`: Follow split into AgentFollow + UserFollow, Fork relations
+// given explicit distinct names, all relations named where a model links twice
+// to the same target.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ── Users ────────────────────────────────────────────────
+model User {
+  id          String   @id @default(cuid())
+  clerkId     String   @unique
+  email       String   @unique
+  username    String?  @unique
+  displayName String?
+  bio         String?
+  avatarUrl   String?
+  tier        UserTier @default(FREE)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  agents       Agent[]
+  tasks        Task[]
+  agentFollows AgentFollow[]
+  following    UserFollow[]  @relation("UserFollowing") // users THIS user follows
+  followers    UserFollow[]  @relation("UserFollowers") // users who follow THIS user
+  forks        Fork[]        @relation("Forker")
+  chatSessions ChatSession[]
+}
+
+enum UserTier {
+  FREE
+  PRO
+  ELITE
+}
+
+// ── Agents ───────────────────────────────────────────────
+model Agent {
+  id          String      @id @default(cuid())
+  ownerId     String
+  owner       User        @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+
+  name        String
+  slug        String      @unique
+  description String?
+  template    Template
+  personality String      @db.Text // system prompt
+  topics      String[]    @default([]) // tag chips shown on the card + feed filter
+
+  visibility  Visibility  @default(PRIVATE)
+  status      AgentStatus @default(IDLE)
+
+  taskCount     Int @default(0)
+  followerCount Int @default(0)
+  forkCount     Int @default(0)
+  viewCount     Int @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  tasks      Task[]
+  memories   AgentMemory[]
+  schedules  Schedule[]
+  followers  AgentFollow[]
+  forksOut   Fork[]        @relation("OriginalAgent") // forks created FROM this agent
+  forkedFrom Fork?         @relation("ForkedAgent")   // the fork that produced this agent
+
+  @@index([ownerId])
+  @@index([visibility, createdAt])
+}
+
+enum Template {
+  RESEARCHER
+  ANALYST
+  WRITER
+  MONITOR
+  DIGEST
+  CUSTOM
+}
+
+enum Visibility {
+  PRIVATE
+  PUBLIC
+}
+
+enum AgentStatus {
+  IDLE
+  THINKING
+  WORKING
+  ERROR
+}
+
+// ── Tasks ────────────────────────────────────────────────
+model Task {
+  id      String     @id @default(cuid())
+  agentId String
+  agent   Agent      @relation(fields: [agentId], references: [id], onDelete: Cascade)
+  userId  String
+  user    User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  prompt   String     @db.Text
+  status   TaskStatus @default(PENDING)
+  result   String?    @db.Text
+  summary  String?    @db.Text // one-line "tweet" of what this run produced (feed card)
+  focus    String?    @db.Text // explicit per-run focus (null = default goal), set at enqueue
+  metadata Json? // token usage, duration, model used, etc.
+  isPublic Boolean    @default(false)
+
+  startedAt   DateTime?
+  completedAt DateTime?
+  createdAt   DateTime  @default(now())
+
+  steps TaskStep[]
+
+  @@index([agentId])
+  @@index([userId])
+  @@index([isPublic, createdAt])
+}
+
+enum TaskStatus {
+  PENDING
+  RUNNING
+  COMPLETED
+  FAILED
+  CANCELLED
+}
+
+model TaskStep {
+  id        String   @id @default(cuid())
+  taskId    String
+  task      Task     @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  stepIndex Int
+  thought   String   @db.Text
+  action    String?  @db.Text // tool call, search query, etc.
+  result    String?  @db.Text
+  createdAt DateTime @default(now())
+
+  @@index([taskId])
+}
+
+// Persistent per-agent memory: durable facts/learnings extracted after each run
+// and fed back into future runs, so an agent gets smarter the longer it works.
+model AgentMemory {
+  id        String   @id @default(cuid())
+  agentId   String
+  agent     Agent    @relation(fields: [agentId], references: [id], onDelete: Cascade)
+  content   String   @db.Text
+  createdAt DateTime @default(now())
+
+  @@index([agentId, createdAt])
+}
+
+// A recurring auto-run for an agent (Fase 4). The in-process worker fires due
+// schedules into the run queue, so monitor/digest agents work on their own.
+model Schedule {
+  id        String    @id @default(cuid())
+  agentId   String
+  agent     Agent     @relation(fields: [agentId], references: [id], onDelete: Cascade)
+  userId    String // who set it (the owner)
+  cadence   String // "hourly" | "daily" | "weekly"
+  focus     String?   @db.Text // optional fixed focus for each scheduled run
+  active    Boolean   @default(true)
+  nextRunAt DateTime
+  lastRunAt DateTime?
+  createdAt DateTime  @default(now())
+
+  @@unique([agentId]) // one schedule per agent (the owner's)
+  @@index([active, nextRunAt])
+}
+
+// ── Follows (split: user→agent and user→user) ────────────
+model AgentFollow {
+  id         String   @id @default(cuid())
+  followerId String
+  follower   User     @relation(fields: [followerId], references: [id], onDelete: Cascade)
+  agentId    String
+  agent      Agent    @relation(fields: [agentId], references: [id], onDelete: Cascade)
+  createdAt  DateTime @default(now())
+
+  @@unique([followerId, agentId])
+  @@index([agentId])
+}
+
+model UserFollow {
+  id          String   @id @default(cuid())
+  followerId  String
+  follower    User     @relation("UserFollowing", fields: [followerId], references: [id], onDelete: Cascade)
+  followingId String
+  following   User     @relation("UserFollowers", fields: [followingId], references: [id], onDelete: Cascade)
+  createdAt   DateTime @default(now())
+
+  @@unique([followerId, followingId])
+  @@index([followingId])
+}
+
+// ── Forks ────────────────────────────────────────────────
+model Fork {
+  id       String @id @default(cuid())
+  forkerId String
+  forker   User   @relation("Forker", fields: [forkerId], references: [id], onDelete: Cascade)
+
+  originalAgentId String
+  originalAgent   Agent  @relation("OriginalAgent", fields: [originalAgentId], references: [id], onDelete: Cascade)
+
+  newAgentId String @unique
+  newAgent   Agent  @relation("ForkedAgent", fields: [newAgentId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+
+  @@index([originalAgentId])
+}
+
+// ── Chat history (Layer 1 sessions) ──────────────────────
+model ChatSession {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  title     String
+  agentRef  String? // "handle/name" when the chat is scoped to an agent
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  messages ChatMessage[]
+
+  @@index([userId, updatedAt])
+}
+
+model ChatMessage {
+  id        String      @id @default(cuid())
+  sessionId String
+  session   ChatSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  role      String // "user" | "assistant"
+  content   String      @db.Text
+  createdAt DateTime    @default(now())
+
+  @@index([sessionId])
+}
